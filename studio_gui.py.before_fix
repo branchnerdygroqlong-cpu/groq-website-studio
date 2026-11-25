@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+"""Groq Website Studio - local web interface."""
+import json
+import mimetypes
+import os
+import re
+import socket
+import sys
+import threading
+import time
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+
+BASE = Path(__file__).resolve().parent
+os.chdir(BASE)
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(BASE / ".env")
+except Exception:
+    pass
+
+from studio_core.agent_runtime import WebsiteAgents  # noqa: E402
+from studio_core.config import PROJECTS_DIR  # noqa: E402
+from studio_core.css_polisher import CSSPolisher  # noqa: E402
+from studio_core.orchestrator import ProjectOrchestrator  # noqa: E402
+from studio_core.page_expander import PageExpander  # noqa: E402
+
+PROJECTS = (BASE / PROJECTS_DIR).resolve()
+PROJECTS.mkdir(parents=True, exist_ok=True)
+
+
+class Job:
+    def __init__(self, job_id):
+        self.id = job_id
+        self.state = "running"
+        self.pending = "failed"   # becomes the visible state once the lock is released
+        self.lines = []
+        self._buf = ""
+        self.site_url = None
+        self.error = None
+        self.lock = threading.Lock()
+
+    def feed(self, text):
+        with self.lock:
+            self._buf += text
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                if line.strip():
+                    self.lines.append(line.rstrip())
+
+    def log(self, line):
+        self.feed(line + "\n")
+
+
+class _StdoutRouter:
+    def __init__(self, real):
+        self.real = real
+        self.local = threading.local()
+
+    def write(self, text):
+        job = getattr(self.local, "job", None)
+        if job is not None:
+            job.feed(text)
+        return self.real.write(text)
+
+    def flush(self):
+        self.real.flush()
+
+    def isatty(self):
+        return False
+
+
+ROUTER = _StdoutRouter(sys.stdout)
+sys.stdout = ROUTER
+
+JOBS = {}
+BUILD_LOCK = threading.Lock()
+
+
+def slugify(name):
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "new-project"
+
+
+def unique_name(name):
+    candidate, n = name, 1
+    while (PROJECTS / slugify(candidate)).exists():
+        n += 1
+        candidate = f"{name} {n}"
+    return candidate
+
+
+def _finish(job, folder):
+    job.site_url = f"/sites/{folder}/index.html"
+    job.pending = "done"
+
+
+def _find_project(app, folder):
+    project = next(
+        (p for p in app.store.list_projects() if Path(p["root_path"]).name == folder),
+        None,
+    )
+    if not project:
+        raise RuntimeError(f"No project found for folder '{folder}'.")
+    return project
+
+
+def run_job(job, name, business_type, brief, expand=False):
+    ROUTER.local.job = job
+    try:
+        app = ProjectOrchestrator()
+        project = app.create_project(name, business_type, brief)
+        job.log(f"Created project #{project['id']}: {project['name']}")
+        WebsiteAgents(project, store=app.store).run(brief)
+        folder = Path(project["root_path"]).name
+        job.log("Homepage built.")
+        if expand:
+            job.log("[pages] Creating the pages the links point to ...")
+            try:
+                PageExpander(project, store=app.store).run()
+            except Exception as exc:
+                job.log(f"[pages] Page creation failed: {exc}")
+        _finish(job, folder)
+        job.log("Build complete.")
+    except Exception as exc:
+        job.error = str(exc)
+        job.pending = "failed"
+        job.log(f"ERROR: {exc}")
+    finally:
+        ROUTER.local.job = None
+        BUILD_LOCK.release()
+        job.state = job.pending
+
+
+def run_expand_job(job, folder):
+    ROUTER.local.job = job
+    try:
+        app = ProjectOrchestrator()
+        project = _find_project(app, folder)
+        job.log(f"[pages] Adding linked pages to {project['name']} ...")
+        PageExpander(project, store=app.store).run()
+        _finish(job, folder)
+        job.log("Done.")
+    except Exception as exc:
+        job.error = str(exc)
+        job.pending = "failed"
+        job.log(f"ERROR: {exc}")
+    finally:
+        ROUTER.local.job = None
+        BUILD_LOCK.release()
+        job.state = job.pending
+
+
+def run_polish_job(job, folder, feedback, undo=False, lint_only=False):
+    ROUTER.local.job = job
+    try:
+        app = ProjectOrchestrator()
+        project = _find_project(app, folder)
+        polisher = CSSPolisher(project, store=app.store)
+        if undo:
+            job.log(f"[polish] {polisher.undo()}")
+        elif lint_only:
+            job.log(f"[polish] Running the free automatic fixes for {project['name']} (no AI) ...")
+            job.log(f"[polish] {polisher.polish(auto_lint_only=True)}")
+        else:
+            job.log(f"[polish] Polishing styles for {project['name']} ...")
+            polisher.polish(feedback=feedback)
+        _finish(job, folder)
+        job.log("Done.")
+    except Exception as exc:
+        job.error = str(exc)
+        job.pending = "failed"
+        job.log(f"ERROR: {exc}")
+    finally:
+        ROUTER.local.job = None
+        BUILD_LOCK.release()
+        job.state = job.pending
+
+
+def list_sites():
+    sites = []
+    for folder in sorted(PROJECTS.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+        if (folder / "index.html").is_file():
+            sites.append({
+                "name": folder.name,
+                "folder": folder.name,
+                "url": f"/sites/{folder.name}/index.html",
+                "has_polish_backup": (folder / "polish_history").is_dir()
+                                  and any((folder / "polish_history").glob("styles.*.css")),
+            })
+    return sites
+
+
+PAGE = r'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Groq Website Studio</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--ink:#16181d;--muted:#5d6572;--line:#dfe3ea;--brand:#4f46e5;--ok:#15803d;--bad:#b91c1c;--soft:#eef2ff}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#181b22;--ink:#eceef2;--muted:#9aa3b2;--line:#2a2f3a;--brand:#818cf8;--ok:#4ade80;--bad:#f87171;--soft:#1e2235}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,Segoe UI,Arial,sans-serif}
+main{max-width:820px;margin:0 auto;padding:2rem 1rem 4rem}
+h1{margin:.2rem 0 .2rem;font-size:1.8rem}.sub{color:var(--muted);margin:0 0 1.5rem}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:1.25rem;margin-bottom:1.25rem}
+label{display:block;font-weight:600;margin:.9rem 0 .3rem}label:first-child{margin-top:0}
+input,textarea{width:100%;padding:.7rem .8rem;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--ink);font:inherit}
+textarea{min-height:130px;resize:vertical}
+button,.btn{display:inline-block;margin-top:1rem;padding:.8rem 1.4rem;border:0;border-radius:10px;background:var(--brand);color:#fff;font:inherit;font-weight:700;cursor:pointer;text-decoration:none}
+button:disabled{opacity:.5;cursor:not-allowed}
+.btn-alt{background:transparent;color:var(--ink);border:1px solid var(--line);font-weight:600}
+.status{display:flex;align-items:center;gap:.6rem;font-weight:600}
+.dot{width:.7rem;height:.7rem;border-radius:50%;background:var(--brand);animation:pulse 1.2s infinite}
+.dot.done{background:var(--ok);animation:none}.dot.failed{background:var(--bad);animation:none}
+@keyframes pulse{50%{opacity:.25}}
+pre{margin:.9rem 0 0;max-height:320px;overflow:auto;padding:.9rem;background:var(--bg);border:1px solid var(--line);border-radius:10px;font:13px/1.45 ui-monospace,Consolas,monospace;white-space:pre-wrap}
+.hint{color:var(--muted);font-size:.9rem;margin:.4rem 0 0}.hidden{display:none}
+ul.sites{list-style:none;margin:0;padding:0}
+ul.sites li{padding:.55rem 0;border-bottom:1px solid var(--line);display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.5rem}
+.acts{display:flex;flex-wrap:wrap;gap:.4rem}
+a{color:var(--brand);font-weight:500}.err{color:var(--bad);font-weight:600}
+.check{display:flex;gap:.5rem;align-items:center;font-weight:400;margin-top:1rem}.check input{width:auto}
+.mini{margin:0;padding:.3rem .75rem;font-size:.85rem;border-radius:8px}
+.tips{background:var(--soft);border-radius:10px;padding:.75rem .9rem;font-size:.88rem;margin:.5rem 0 .8rem;line-height:1.45}
+.tips ul{margin:.25rem 0 0;padding-left:1.2rem}
+</style></head><body><main>
+<h1>Groq Website Studio</h1>
+<p class="sub">Describe a website, press Build, and the finished page opens when it is ready.</p>
+
+<div class="card">
+  <label for="name">Website name (optional)</label>
+  <input id="name" placeholder="e.g. Edwin's Page">
+  <label for="brief">Describe the website you want</label>
+  <textarea id="brief" placeholder="e.g. Homepage for a neighborhood bakery: sourdough, pastries, custom cakes, warm colors, order-inquiry form. Leave hours and phone as placeholders."></textarea>
+  <p class="hint">Include the type of site, sections, tone and colors. Anything you do not specify becomes a [placeholder].</p>
+  <label class="check"><input type="checkbox" id="expand" checked> Also create the pages the links point to (takes longer)</label>
+  <button id="go">Build website</button>
+</div>
+
+<div class="card hidden" id="polish-panel" style="border-color:var(--brand)">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <strong>Polish CSS: <span id="polish-target"></span></strong>
+    <button class="mini btn-alt" id="polish-close" type="button">Close</button>
+  </div>
+  <div class="tips">
+    <strong>Examples of things you can ask the CSS polisher to fix:</strong>
+    <ul>
+      <li><b>Spacing:</b> "Add more padding between sections" or "Increase gaps between cards and list items"</li>
+      <li><b>Layout:</b> "Stack items vertically instead of side-by-side" or "Center the hero text"</li>
+      <li><b>Visual separation:</b> "Add subtle borders or alternating backgrounds between sections"</li>
+      <li><b>Colors &amp; Fonts:</b> "Make the background darker with brighter yellow accents" or "Make headings larger"</li>
+      <li><b>Free fixes only:</b> repairs known CSS bugs (missing units, hidden-text classes) without using any AI quota</li>
+      <li><b>Auto-Diagnose:</b> Click <b>Auto-Diagnose Issues</b> to have an AI agent inspect your page and fill in recommended fixes automatically</li>
+    </ul>
+  </div>
+  <label for="polish-feedback">What looks wrong or needs improvement? (optional)</label>
+  <textarea id="polish-feedback" style="min-height:95px" placeholder="Click 'Auto-Diagnose Issues' to inspect the page automatically, or type your own instructions here..."></textarea>
+  <div style="display:flex;gap:.5rem;flex-wrap:wrap">
+    <button id="polish-auto" class="btn-alt" type="button">Auto-Diagnose Issues</button>
+    <button id="polish-free" class="btn-alt" type="button">Free fixes only (no AI)</button>
+    <button id="polish-run" type="button">Apply CSS Polish</button>
+    <button id="polish-undo" class="btn-alt hidden" type="button">Undo last polish</button>
+  </div>
+</div>
+
+<div class="card hidden" id="progress">
+  <div class="status"><span class="dot" id="dot"></span><span id="phase">Starting...</span></div>
+  <pre id="log"></pre>
+  <div id="result" class="hidden"><a class="btn" id="open" target="_blank" rel="noopener">Open your website</a></div>
+</div>
+
+<div class="card"><strong>Previous sites</strong><ul class="sites" id="sites"></ul></div>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+let timer=null,job=null,since=0,polishFolder=null,sitesCache=[];
+function setBusy(b){["go","polish-run","polish-undo","polish-auto","polish-free"].forEach(id=>{$(id).disabled=b;});}
+function refreshUndo(){const m=sitesCache.find(x=>x.folder===polishFolder);$("polish-undo").classList.toggle("hidden",!(m&&m.has_polish_backup));}
+
+function phaseFrom(line){
+  if(/\[polish\]/.test(line))return"Polishing CSS styles";
+  if(/\[pages\]/.test(line))return"Creating the linked pages";
+  if(/\[images\]/.test(line))return"Sourcing images";
+  if(/waiting \d+s/.test(line))return"Waiting for the free-tier rate limit (normal)";
+  if(/HTML /.test(line))return"Writing page sections";
+  if(/CSS /.test(line))return"Styling the page";
+  if(/Created project/.test(line))return"Planning the site";
+  return null;
+}
+
+function openPolish(s){
+  polishFolder=s.folder;
+  $("polish-target").textContent=s.name;
+  $("polish-feedback").value="";
+  $("polish-undo").classList.toggle("hidden",!s.has_polish_backup);
+  $("polish-panel").classList.remove("hidden");
+  $("polish-panel").scrollIntoView({behavior:"smooth",block:"nearest"});
+}
+
+async function loadSites(){
+  const r=await fetch("/api/sites");
+  const list=await r.json();
+  sitesCache=list;refreshUndo();
+  const ul=$("sites");
+  ul.innerHTML="";
+  if(!list.length){ul.innerHTML="<li>None yet.</li>";return;}
+  list.forEach(s=>{
+    const li=document.createElement("li");
+    const a=document.createElement("a");
+    a.href=s.url;a.target="_blank";a.rel="noopener";a.textContent=s.name;
+    li.appendChild(a);
+    const acts=document.createElement("div");
+    acts.className="acts";
+    const bp=document.createElement("button");
+    bp.className="mini";bp.textContent="Polish CSS";bp.onclick=()=>openPolish(s);
+    acts.appendChild(bp);
+    const be=document.createElement("button");
+    be.className="mini btn-alt";be.textContent="Add linked pages";be.onclick=()=>begin("/api/expand",{folder:s.folder});
+    acts.appendChild(be);
+    li.appendChild(acts);
+    ul.appendChild(li);
+  });
+}
+
+async function poll(){
+  const r=await fetch(`/api/status?job=${job}&since=${since}`);
+  const d=await r.json();
+  d.lines.forEach(l=>{$("log").textContent+=l+"\n";const p=phaseFrom(l);if(p)$("phase").textContent=p;});
+  since=d.next;$("log").scrollTop=$("log").scrollHeight;
+  if(d.state==="done"){
+    clearInterval(timer);$("dot").className="dot done";$("phase").textContent="Done - your website is ready";
+    $("open").href=d.site_url;$("result").classList.remove("hidden");
+    setBusy(false);
+    loadSites();window.open(d.site_url,"_blank");
+  }else if(d.state==="failed"){
+    clearInterval(timer);$("dot").className="dot failed";
+    $("phase").innerHTML='<span class="err">Task failed - see the log below</span>';
+    setBusy(false);
+  }
+}
+
+async function begin(url,payload){
+  setBusy(true);
+  $("progress").classList.remove("hidden");$("result").classList.add("hidden");
+  $("log").textContent="";$("dot").className="dot";$("phase").textContent="Starting...";since=0;
+  const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+  const d=await r.json();
+  if(!r.ok){
+    $("dot").className="dot failed";$("phase").innerHTML='<span class="err"></span>';
+    $("phase").firstChild.textContent=d.error||"Could not start";
+    setBusy(false);return;
+  }
+  job=d.job;timer=setInterval(poll,1000);
+}
+
+$("go").onclick=()=>{
+  const brief=$("brief").value.trim();
+  if(brief.length<10){alert("Please describe the website you want (at least a sentence).");return;}
+  begin("/api/build",{name:$("name").value.trim(),brief,expand:$("expand").checked});
+};
+$("polish-close").onclick=()=>$("polish-panel").classList.add("hidden");
+$("polish-auto").onclick=async()=>{
+  if(!polishFolder)return;
+  const btn=$("polish-auto");btn.disabled=true;btn.textContent="Inspecting page...";
+  try{
+    const r=await fetch("/api/critique",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({folder:polishFolder})});
+    const d=await r.json();
+    if(!r.ok)alert(d.error||"Diagnosis failed");
+    else $("polish-feedback").value=d.suggestion;
+  }finally{btn.disabled=false;btn.textContent="Auto-Diagnose Issues";}
+};
+$("polish-run").onclick=()=>{if(polishFolder)begin("/api/polish",{folder:polishFolder,feedback:$("polish-feedback").value.trim(),undo:false});};
+$("polish-free").onclick=()=>{if(polishFolder)begin("/api/polish",{folder:polishFolder,feedback:"",undo:false,lint_only:true});};
+$("polish-undo").onclick=()=>{if(polishFolder)begin("/api/polish",{folder:polishFolder,feedback:"",undo:true});};
+loadSites();
+</script></body></html>
+'''
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def _send(self, code, body, ctype="application/json"):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body).encode("utf-8")
+        elif isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        url = urlparse(self.path)
+        if url.path == "/":
+            return self._send(200, PAGE, "text/html; charset=utf-8")
+        if url.path == "/api/sites":
+            return self._send(200, list_sites())
+        if url.path == "/api/status":
+            query = parse_qs(url.query)
+            job_id = (query.get("job") or [""])[0]
+            job = JOBS.get(job_id)
+            if not job:
+                return self._send(404, {"error": "unknown job"})
+            since = int((query.get("since") or ["0"])[0] or 0)
+            with job.lock:
+                lines = job.lines[since:]
+                nxt = len(job.lines)
+            return self._send(200, {"state": job.state, "lines": lines, "next": nxt,
+                                    "site_url": job.site_url, "error": job.error})
+        if url.path.startswith("/sites/"):
+            return self._serve_site(unquote(url.path[len("/sites/"):]))
+        self._send(404, {"error": "not found"})
+
+    def _serve_site(self, relative):
+        target = (PROJECTS / relative).resolve()
+        if PROJECTS not in target.parents and target != PROJECTS:
+            return self._send(403, {"error": "forbidden"})
+        if target.is_dir():
+            target = target / "index.html"
+        if not target.is_file():
+            return self._send(404, {"error": "not found"})
+        ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        if ctype.startswith("text/") or ctype in ("application/javascript", "image/svg+xml"):
+            ctype += "; charset=utf-8"
+        self._send(200, target.read_bytes(), ctype)
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path not in ("/api/build", "/api/expand", "/api/polish", "/api/critique"):
+            return self._send(404, {"error": "not found"})
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            data = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            return self._send(400, {"error": "invalid request"})
+        if not os.getenv("GROQ_API_KEY"):
+            return self._send(400, {"error": "GROQ_API_KEY is not set."})
+        if path == "/api/critique":
+            folder = str(data.get("folder", "")).strip()
+            if not re.fullmatch(r"[a-z0-9-]+", folder) or not (PROJECTS / folder / "index.html").is_file():
+                return self._send(400, {"error": "Unknown site."})
+            if not BUILD_LOCK.acquire(blocking=False):
+                return self._send(409, {"error": "A task is already running. Wait for it to finish."})
+            try:
+                app = ProjectOrchestrator()
+                project = _find_project(app, folder)
+                result = (200, {"suggestion": CSSPolisher(project, store=app.store).critique()})
+            except Exception as exc:
+                result = (400, {"error": str(exc)})
+            finally:
+                BUILD_LOCK.release()
+            return self._send(*result)
+        if path in ("/api/expand", "/api/polish"):
+            folder = str(data.get("folder", "")).strip()
+            if not re.fullmatch(r"[a-z0-9-]+", folder) or not (PROJECTS / folder / "index.html").is_file():
+                return self._send(400, {"error": "Unknown site."})
+            if path == "/api/expand":
+                target, args = run_expand_job, (folder,)
+            else:
+                feedback = str(data.get("feedback", "")).strip()[:2000]
+                undo = bool(data.get("undo", False))
+                target, args = run_polish_job, (folder, feedback, undo, bool(data.get("lint_only", False)))
+        else:
+            brief = str(data.get("brief", "")).strip()
+            if len(brief) < 10:
+                return self._send(400, {"error": "Please describe the website you want."})
+            name = str(data.get("name", "")).strip()[:60] or f"Website {time.strftime('%Y-%m-%d %H%M')}"
+            target, args = run_job, (None, "", brief, bool(data.get("expand")))
+        if not BUILD_LOCK.acquire(blocking=False):
+            return self._send(409, {"error": "A task is already running."})
+        job = Job(f"{int(time.time() * 1000)}")
+        JOBS[job.id] = job
+        if path == "/api/build":
+            args = (unique_name(name), "", brief, bool(data.get("expand")))
+        threading.Thread(target=target, args=(job,) + args, daemon=True).start()
+        self._send(200, {"job": job.id})
+
+
+def free_port(start=8765):
+    for port in range(start, start + 20):
+        with socket.socket() as probe:
+            if probe.connect_ex(("127.0.0.1", port)) != 0:
+                return port
+    raise RuntimeError("No free port found between 8765 and 8784.")
+
+
+def main():
+    port = free_port()
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = f"http://127.0.0.1:{port}"
+    print(f"Groq Website Studio running at {url}   (Ctrl-C to stop)", flush=True)
+    if not os.getenv("GROQ_API_KEY"):
+        print("WARNING: GROQ_API_KEY is not set; builds will be refused until it is.", flush=True)
+    threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
+if __name__ == "__main__":
+    main()

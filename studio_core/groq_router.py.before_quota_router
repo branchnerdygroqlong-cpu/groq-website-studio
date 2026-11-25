@@ -1,0 +1,48 @@
+import json
+import os
+import time
+from groq import Groq
+from .config import MODEL_LIMITS, DEFAULT_LIMITS
+from .storage import Store
+
+def estimate_tokens(messages, tools=None):
+    payload = json.dumps(messages, default=str) + (json.dumps(tools, default=str) if tools else "")
+    return max(1, len(payload)//4)
+
+class GroqRouter:
+    """Central Groq client with model fallback and persistent usage accounting."""
+    def __init__(self, store=None, client=None):
+        key = os.getenv("GROQ_API_KEY")
+        if client is None and not key:
+            raise RuntimeError("GROQ_API_KEY is not set. Export it before making Groq calls.")
+        self.client = client or Groq(api_key=key)
+        self.store = store or Store()
+    def limits(self, model):
+        return MODEL_LIMITS.get(model, DEFAULT_LIMITS)
+    def chat(self, model, messages, tools=None, estimated_out_tokens=1000, fallback_models=None):
+        candidates = [model] + (fallback_models or [])
+        input_tokens = estimate_tokens(messages, tools)
+        selected = None
+        for candidate in candidates:
+            lim = self.limits(candidate)
+            if tools and not lim.get("supports_tools", False):
+                continue
+            u = self.store.usage(candidate)
+            output = min(estimated_out_tokens, lim["max_out"])
+            if (u["daily_requests"] < lim["rpd"] and
+                u["daily_tokens"] + input_tokens + output <= lim["tpd"] and
+                u["minute_tokens"] + input_tokens + output <= lim["tpm"] and
+                u["minute_requests"] < lim["rpm"]):
+                selected = candidate
+                break
+        if selected is None:
+            raise RuntimeError("No candidate model has sufficient locally tracked quota. Wait or review model limits.")
+        lim = self.limits(selected)
+        max_tokens = min(estimated_out_tokens, lim["max_out"], max(64, lim["tpm"]-input_tokens-100))
+        kwargs = {"model":selected,"messages":messages,"max_tokens":max_tokens}
+        if tools:
+            kwargs.update(tools=tools, tool_choice="auto")
+        response = self.client.chat.completions.create(**kwargs)
+        used = getattr(response.usage, "total_tokens", input_tokens+max_tokens)
+        self.store.record_usage(selected,time.time(),used)
+        return response

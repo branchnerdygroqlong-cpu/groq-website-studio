@@ -1,0 +1,247 @@
+"""Deterministic CSS linter and feedback-driven visual polisher.
+
+1. Automatically fixes common LLM CSS bugs (unitless spacing variables, missing
+   .sr-only / .visually-hidden utilities) without spending API tokens.
+2. Critiques existing HTML + CSS to suggest plain-English layout fixes.
+3. Takes plain-English user feedback, inspects the HTML structure and existing CSS
+   variables, and generates targeted CSS overrides with atomic backup/undo.
+
+Run from terminal:
+  python -m studio_core.css_polisher PROJECT_ID --feedback "Add more space between sections"
+  python -m studio_core.css_polisher PROJECT_ID --undo
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import tempfile
+from pathlib import Path
+
+from .agent_runtime import _clean_output
+from .config import MODELS
+from .groq_router import GroqRouter
+from .html_assembler import validate_css
+from .storage import Store
+
+_SR_ONLY_RULE = (
+    ".sr-only,.visually-hidden{position:absolute;width:1px;height:1px;"
+    "padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);"
+    "white-space:nowrap;border:0}"
+)
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-", suffix=".css")
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+        stream.write(content)
+    os.replace(tmp, path)
+
+
+def lint_and_fix_css(css: str, html: str = "") -> tuple[str, list[str]]:
+    """Deterministically repair common model CSS mistakes."""
+    fixes = []
+
+    def _add_rem_unit(match: re.Match) -> str:
+        prop, val = match.group(1), match.group(2)
+        if float(val) == 0:
+            return f"{prop}: 0;"
+        fixes.append(f"added 'rem' unit to {prop}: {val}")
+        return f"{prop}: {val}rem;"
+
+    fixed_css = re.sub(
+        r"(--(?:space|gap|pad|padding|margin|radius|size)[a-zA-Z0-9_-]*)\s*:\s*([0-9]*\.?[0-9]+)\s*;",
+        _add_rem_unit,
+        css,
+    )
+
+    if html and ("sr-only" in html or "visually-hidden" in html):
+        if ".sr-only" not in fixed_css:
+            fixed_css = fixed_css.rstrip() + "\n\n/* UTILITY FIX */\n" + _SR_ONLY_RULE + "\n"
+            fixes.append("added missing .sr-only accessibility utility")
+
+    return fixed_css, list(dict.fromkeys(fixes))
+
+
+def _summarize_dom(html: str) -> str:
+    """Extract a compact structural outline of tags, IDs, and classes for the prompt."""
+    outline = []
+    for match in re.finditer(r"<(header|nav|main|section|article|aside|footer|div|ul|form)\b([^>]*)>", html, re.I):
+        tag = match.group(1).lower()
+        attrs = match.group(2)
+        id_m = re.search(r'\bid\s*=\s*["\']([^"\']+)["\']', attrs, re.I)
+        cls_m = re.search(r'\bclass\s*=\s*["\']([^"\']+)["\']', attrs, re.I)
+        if id_m or cls_m:
+            ident = f"#{id_m.group(1)}" if id_m else ""
+            classes = "".join(f".{c}" for c in cls_m.group(1).split()[:4]) if cls_m else ""
+            entry = f"{tag}{ident}{classes}"
+            if entry not in outline:
+                outline.append(entry)
+    return ", ".join(outline[:45])
+
+
+class CSSPolisher:
+    def __init__(self, project: dict, store: Store | None = None, router: GroqRouter | None = None):
+        self.project = project
+        self.store = store or Store()
+        self.router = router or GroqRouter(self.store)
+        self.root = Path(project["root_path"]).resolve()
+        self.css_path = self.root / "styles.css"
+        self.backup_path = self.root / "styles.css.before_polish"
+
+    def _models(self) -> list[str]:
+        return [MODELS["dev_fallback"], MODELS["pm"], MODELS["dev_agent"]]
+
+    def undo(self) -> str:
+        if not self.backup_path.is_file():
+            raise RuntimeError("No polish backup found to restore.")
+        shutil.copy2(self.backup_path, self.css_path)
+        return "Restored styles.css from pre-polish backup."
+
+    def critique(self) -> str:
+        """Inspect index.html and styles.css and suggest concrete visual/layout fixes."""
+        index_path = self.root / "index.html"
+        if not index_path.is_file() or not self.css_path.is_file():
+            raise RuntimeError("Project is missing index.html or styles.css.")
+
+        html = index_path.read_text(encoding="utf-8")
+        css = self.css_path.read_text(encoding="utf-8")
+
+        if hasattr(self.router, "reset_budget"):
+            self.router.reset_budget()
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a senior frontend UI/CSS critic. Inspect the HTML and CSS for "
+                    "layout bugs, visual clutter, and styling collisions. Specifically check for: "
+                    "1) mid-stylesheet '*' or 'body' resets/padding that break full-width headers, "
+                    "2) conflicting class rules (e.g., subpage styles overriding homepage sections), "
+                    "3) cramped spacing or missing visual borders/contrast between sections, "
+                    "4) multi-element containers accidentally set to flex-direction: row. "
+                    "Return ONLY a concise, plain-English paragraph of specific CSS fixes to apply. "
+                    "No code blocks, no markdown, no greetings."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Project: {self.project['name']}\n\n"
+                    f"HTML (index.html):\n{html[:4500]}\n\n"
+                    f"CSS (styles.css):\n{css[:6000]}"
+                ),
+            },
+        ]
+
+        resp = self.router.chat(
+            MODELS["pm"],
+            messages,
+            estimated_out_tokens=400,
+            fallback_models=[MODELS["dev_fallback"], MODELS["dev_agent"]],
+        )
+        return (resp.choices[0].message.content or "").strip()
+
+    def polish(self, feedback: str = "", auto_lint_only: bool = False) -> str:
+        if not self.css_path.is_file():
+            raise RuntimeError("Project has no styles.css to polish.")
+
+        index_path = self.root / "index.html"
+        html = index_path.read_text(encoding="utf-8") if index_path.is_file() else ""
+        original_css = self.css_path.read_text(encoding="utf-8")
+
+        shutil.copy2(self.css_path, self.backup_path)
+
+        css, fixes = lint_and_fix_css(original_css, html)
+        if fixes:
+            print(f"[polish] Auto-fixed {len(fixes)} CSS issue(s): {', '.join(fixes)}", flush=True)
+
+        if auto_lint_only and not feedback.strip():
+            validate_css(css)
+            _atomic_write(self.css_path, css)
+            return f"Applied {len(fixes)} automatic CSS fix(es)."
+
+        if hasattr(self.router, "reset_budget"):
+            self.router.reset_budget()
+
+        variables = ", ".join(dict.fromkeys(re.findall(r"--[a-zA-Z0-9_-]+", css)))[:600]
+        dom_outline = _summarize_dom(html)[:1200]
+        user_notes = feedback.strip() or (
+            "Improve overall visual polish: increase vertical whitespace between sections, "
+            "add subtle section borders or alternating surface contrast, prevent cramped cards, "
+            "and ensure clean vertical stacking inside multi-element containers."
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a senior UI/CSS designer polishing an existing stylesheet. "
+                    "Return ONLY valid CSS override rules to append at the end of styles.css. "
+                    "No HTML, no Markdown fences, no commentary. Reuse existing CSS variables "
+                    "where available. Ensure generous section padding (e.g., 4rem to 6rem), "
+                    "clear visual separation between sections, clean grid/flex alignment, and "
+                    "readable spacing between items. Do not break mobile responsiveness."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Project: {self.project['name']}\n"
+                    f"Existing CSS variables: {variables or 'none'}\n"
+                    f"HTML structure outline: {dom_outline}\n\n"
+                    f"Requested visual changes:\n{user_notes}\n\n"
+                    f"Current CSS tail (for context):\n{css[-2500:]}"
+                ),
+            },
+        ]
+
+        print("[polish] Generating targeted CSS refinements ...", flush=True)
+        patch_css, model_used = self.router.generate(
+            self._models(),
+            messages,
+            validate_css,
+            estimated_out_tokens=1200,
+            label="CSS Polish",
+            clean=_clean_output,
+        )
+
+        merged = (
+            css.rstrip()
+            + f"\n\n/* VISUAL POLISH ({model_used}) */\n"
+            + patch_css.strip()
+            + "\n"
+        )
+        validate_css(merged)
+        _atomic_write(self.css_path, merged)
+
+        summary = f"Polished styles.css using {model_used}"
+        if fixes:
+            summary += f" (plus {len(fixes)} auto-fix(es))"
+        print(f"[polish] {summary}", flush=True)
+        return summary
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Polish a generated project's CSS.")
+    parser.add_argument("project_id", type=int, help="Project ID from `studio_cli.py projects`")
+    parser.add_argument("--feedback", default="", help="Describe what looks wrong or what to improve")
+    parser.add_argument("--lint-only", action="store_true", help="Only run deterministic CSS fixes")
+    parser.add_argument("--undo", action="store_true", help="Revert styles.css to before the last polish")
+    args = parser.parse_args()
+
+    store = Store()
+    project = store.get_project(args.project_id)
+    if not project:
+        raise SystemExit(f"Project #{args.project_id} not found.")
+
+    polisher = CSSPolisher(project, store=store)
+    if args.undo:
+        print(polisher.undo())
+    else:
+        print(polisher.polish(feedback=args.feedback, auto_lint_only=args.lint_only))
+
+
+if __name__ == "__main__":
+    main()

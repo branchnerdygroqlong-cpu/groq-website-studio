@@ -1,0 +1,28 @@
+import os
+
+MODELS = {
+    "pm": os.getenv("GROQ_PM_MODEL", "openai/gpt-oss-120b"),
+    "image_agent": os.getenv("GROQ_IMAGE_MODEL", "openai/gpt-oss-20b"),
+    "dev_agent": os.getenv("GROQ_DEV_MODEL", "qwen/qwen3.8-27b"),
+    "dev_fallback": os.getenv("GROQ_DEV_FALLBACK", "openai/gpt-oss-20b"),
+    "fast_worker": os.getenv("GROQ_FAST_MODEL", "allam-2-7b"),
+    "guard_strict": os.getenv("GROQ_GUARD_MODEL", "meta-llama/llama-prompt-guard-2-86m"),
+    "guard_fast": "meta-llama/llama-prompt-guard-2-22m",
+}
+
+# Account limits supplied by the user. TPM is combined input + output throughput.
+# max_out is a per-request client-side ceiling, not a promise of reserved quota.
+MODEL_LIMITS = {
+    "allam-2-7b": dict(rpm=30, rpd=7000, tpm=6000, tpd=500000, max_out=1500, supports_tools=False),
+    "meta-llama/llama-prompt-guard-2-22m": dict(rpm=30, rpd=14400, tpm=15000, tpd=500000, max_out=64, supports_tools=False),
+    "meta-llama/llama-prompt-guard-2-86m": dict(rpm=30, rpd=14400, tpm=15000, tpd=500000, max_out=64, supports_tools=False),
+    "openai/gpt-oss-120b": dict(rpm=30, rpd=1000, tpm=8000, tpd=200000, max_out=2500, supports_tools=True),
+    "openai/gpt-oss-20b": dict(rpm=30, rpd=1000, tpm=8000, tpd=200000, max_out=1800, supports_tools=True),
+    "openai/gpt-oss-safeguard-20b": dict(rpm=3, rpd=1000, tpm=2000, tpd=200000, max_out=900, supports_tools=False),
+    # otpm: output-tokens-per-minute actually enforced by Groq (observed 1,000), despite the 8,000 TPM.
+    "qwen/qwen3.8-27b": dict(rpm=30, rpd=1000, tpm=8000, tpd=200000, max_out=1000, otpm=1000, supports_tools=True),
+}
+DEFAULT_LIMITS = dict(rpm=30, rpd=1000, tpm=6000, tpd=200000, max_out=1000, supports_tools=False)
+
+DB_PATH = os.getenv("STUDIO_DB_PATH", "studio_data/studio.sqlite3")
+PROJECTS_DIR = os.getenv("STUDIO_PROJECTS_DIR", "projects")

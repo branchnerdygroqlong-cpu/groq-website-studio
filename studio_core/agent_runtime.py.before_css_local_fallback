@@ -1,0 +1,609 @@
+"""Runtime agents for Groq Website Studio.
+
+The frontend pipeline deliberately generates CSS and HTML fragments separately.
+html_assembler.py owns the document wrapper and validates every fragment before
+publishing the page.
+"""
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+
+from .config import MODELS
+from .groq_router import GroqRouter
+from .html_assembler import assemble_page
+from .storage import Store
+
+
+def _clean_output(text: str) -> str:
+    text = (text or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines:
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
+
+
+def _finish_reason(response) -> str | None:
+    try:
+        return response.choices[0].finish_reason
+    except (AttributeError, IndexError, TypeError):
+        return None
+
+
+def _message(response):
+    try:
+        return response.choices[0].message
+    except (AttributeError, IndexError, TypeError) as exc:
+        raise RuntimeError("Groq returned an empty or unrecognized completion.") from exc
+
+
+def _is_malformed_tool_call_error(exc: Exception) -> bool:
+    """Identify Groq's 400 response for truncated/invalid tool-call JSON."""
+    message = str(exc).lower()
+    return (
+        "failed to parse tool call arguments as json" in message
+        or ("tool_use_failed" in message and "failed_generation" in message)
+    )
+
+
+def _validate_build_plan(args):
+    """Reject oversized or incomplete plans before starting downstream agents."""
+    if not isinstance(args, dict):
+        raise RuntimeError("Project Manager returned a build plan that is not an object.")
+    for key in ("image_brief", "site_design_summary", "build_chunks"):
+        if key not in args:
+            raise RuntimeError(f"Project Manager omitted required field: {key}")
+    if not isinstance(args["image_brief"], str) or not args["image_brief"].strip():
+        raise RuntimeError("Project Manager returned an empty image_brief.")
+    if not isinstance(args["site_design_summary"], str) or not args["site_design_summary"].strip():
+        raise RuntimeError("Project Manager returned an empty site_design_summary.")
+    if len(args["image_brief"]) > 300:
+        raise RuntimeError("Project Manager image_brief exceeded 300 characters.")
+    if len(args["site_design_summary"]) > 900:
+        raise RuntimeError("Project Manager site_design_summary exceeded 900 characters.")
+    chunks = args["build_chunks"]
+    if not isinstance(chunks, list) or len(chunks) != 5:
+        raise RuntimeError("Project Manager must return exactly five concise homepage sections.")
+    for index, chunk in enumerate(chunks, 1):
+        if not isinstance(chunk, dict):
+            raise RuntimeError(f"Build section {index} is not an object.")
+        title = chunk.get("chunk_title")
+        instructions = chunk.get("instructions")
+        if not isinstance(title, str) or not title.strip() or len(title) > 80:
+            raise RuntimeError(f"Build section {index} has an invalid title.")
+        if not isinstance(instructions, str) or not instructions.strip() or len(instructions) > 500:
+            raise RuntimeError(
+                f"Build section '{title}' has empty or oversized instructions (maximum 500 characters)."
+            )
+        try:
+            estimate = int(chunk.get("estimated_tokens", 800))
+        except (TypeError, ValueError):
+            estimate = 800
+        chunk["estimated_tokens"] = max(500, min(estimate, 1100))
+    return args
+
+
+def _safe_filename(value):
+    name = re.sub(r"[^a-zA-Z0-9_-]+", "-", Path(str(value)).stem).strip("-")
+    return (name or "image")[:70]
+
+
+class WebsiteAgents:
+    def __init__(self, project, store=None, router=None):
+        self.project = project
+        self.store = store or Store()
+        self.router = router or GroqRouter(self.store)
+        self.root = Path(project["root_path"]).resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.assets = self.root / "assets"
+        self.assets.mkdir(exist_ok=True)
+        self.asset_report = (
+            "No local images sourced; use CSS gradients or simple inline SVG where appropriate."
+        )
+
+    def _write(self, relative, content, mode="w"):
+        target = (self.root / relative).resolve()
+        if self.root not in target.parents and target != self.root:
+            raise ValueError("Refusing to write outside the project directory.")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open(mode, encoding="utf-8") as stream:
+            stream.write(content)
+        return target
+
+    def source_images(self, brief):
+        """Ask the image agent for optional Wikimedia Commons assets."""
+        import requests
+
+        tool_schema = [{
+            "type": "function",
+            "function": {
+                "name": "search_and_download_wikimedia_image",
+                "description": (
+                    "Find one relevant Wikimedia Commons image and download it into "
+                    "this project's assets folder. Only use images with identifiable "
+                    "license metadata; report the source and license."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "filename": {"type": "string"},
+                    },
+                    "required": ["query", "filename"],
+                },
+            },
+        }]
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You source a small number of relevant images for a website. "
+                    "Call search_and_download_wikimedia_image only for useful images. "
+                    "Never claim a license is public domain unless the API says so. "
+                    "If uncertain, skip the image."
+                ),
+            },
+            {"role": "user", "content": str(brief)[:5000]},
+        ]
+        report = []
+        for _ in range(6):
+            response = self.router.chat(
+                MODELS["image_agent"], messages, tools=tool_schema,
+                estimated_out_tokens=500,
+                fallback_models=[MODELS["dev_agent"], MODELS["pm"]],
+            )
+            msg = _message(response)
+            messages.append(msg)
+            if not getattr(msg, "tool_calls", None):
+                if _finish_reason(response) == "length":
+                    raise RuntimeError("Image agent response was truncated by the token limit.")
+                if msg.content:
+                    report.append(msg.content)
+                break
+            for call in msg.tool_calls:
+                if call.function.name != "search_and_download_wikimedia_image":
+                    raise RuntimeError(f"Unexpected image-agent tool: {call.function.name}")
+                args = json.loads(call.function.arguments)
+                result = self._download_wikimedia(
+                    requests, args.get("query", ""), args.get("filename", "website-image")
+                )
+                report.append(result)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "name": call.function.name,
+                    "content": result,
+                })
+        self.asset_report = "\n".join(report) or "No images downloaded; use CSS/SVG fallbacks."
+        return self.asset_report
+
+    def _download_wikimedia(self, requests, query, filename):
+        api = "https://commons.wikimedia.org/w/api.php"
+        headers = {"User-Agent": "GroqWebsiteStudio/0.3 (local website development)"}
+        try:
+            response = requests.get(
+                api,
+                params={
+                    "action": "query", "format": "json", "generator": "search",
+                    "gsrsearch": f"filetype:bitmap {query}", "gsrnamespace": 6,
+                    "gsrlimit": 5, "prop": "imageinfo", "iiprop": "url|extmetadata",
+                },
+                headers=headers, timeout=20,
+            )
+            response.raise_for_status()
+            pages = response.json().get("query", {}).get("pages", {})
+            for page in pages.values():
+                info = (page.get("imageinfo") or [{}])[0]
+                url = info.get("url", "")
+                if not url.lower().split("?")[0].endswith((".jpg", ".jpeg", ".png", ".webp")):
+                    continue
+                download = requests.get(url, headers=headers, timeout=25)
+                download.raise_for_status()
+                ext = Path(url.split("?")[0]).suffix.lower()
+                name = _safe_filename(filename) + ext
+                (self.assets / name).write_bytes(download.content)
+                metadata = info.get("extmetadata", {})
+                license_name = metadata.get("LicenseShortName", {}).get(
+                    "value", "license not confirmed"
+                )
+                page_url = page.get("canonicalurl", "Wikimedia Commons")
+                return (
+                    f"Downloaded assets/{name}; source: {page_url}; "
+                    f"license metadata: {license_name}. Verify usage terms before publication."
+                )
+            return f"No suitable image found for '{query}'; use a CSS/SVG fallback."
+        except Exception as exc:
+            return f"Image search failed for '{query}': {exc}. Use a CSS/SVG fallback."
+
+    def _generate_css(self, design_summary):
+        """Generate compact CSS fragments with model fallback."""
+        from .html_assembler import validate_css
+
+        common = (
+            f"Website: {self.project['name']}\\n"
+            f"Design: {design_summary[:1000]}\\n"
+        )
+
+        sections = [
+            ("FOUNDATION", "Create :root color variables, box sizing reset, body, headings, paragraphs, and links."),
+            ("HEADER AND HERO", "Create compact responsive header, navigation, hero layout, hero heading, and hero CTA styles."),
+            ("CONTENT AND CTA", "Create reusable section containers, responsive cards, buttons, CTA panels, and footer styles."),
+            ("RESPONSIVE", "Create mobile-first responsive rules for header, navigation, hero, cards, and content spacing. Use one or two media queries."),
+            ("ACCESSIBILITY", "Create visible keyboard focus styles, reduced-motion rules, accessible button states, and readable small-screen typography."),
+        ]
+
+        # Allam has already demonstrated that it can generate usable CSS.
+        # Keep every requested completion below the confirmed Qwen OTPM limit.
+        models = [
+            MODELS["fast_worker"],
+            MODELS["dev_fallback"],
+            MODELS["dev_agent"],
+        ]
+
+        generated = []
+
+        for section_name, instructions in sections:
+            user_text = (
+                common
+                + "\\nCSS SECTION: " + section_name + "\\n"
+                + instructions
+                + " Return only concise, valid CSS. No Markdown. "
+                + "Close every brace and quote. Avoid duplicate rules."
+            )
+
+            errors = []
+            css_part = None
+
+            for model in models:
+                try:
+                    response = self.router.chat(
+                        model,
+                        [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are an expert CSS engineer. Return "
+                                    "only a small, complete CSS fragment. "
+                                    "Use concise declarations and complete "
+                                    "selectors. No HTML or explanations."
+                                ),
+                            },
+                            {"role": "user", "content": user_text},
+                        ],
+                        estimated_out_tokens=500,
+                        fallback_models=[],
+                    )
+
+                    if _finish_reason(response) == "length":
+                        errors.append(f"{model}: truncated at 500 tokens")
+                        continue
+
+                    candidate = _clean_output(
+                        _message(response).content or ""
+                    ).strip()
+
+                    if not candidate:
+                        errors.append(f"{model}: empty response")
+                        continue
+
+                    try:
+                        validate_css(candidate)
+                    except Exception as exc:
+                        errors.append(f"{model}: invalid CSS: {exc}")
+                        continue
+
+                    css_part = candidate
+                    print(f"CSS section completed: {section_name} ({model})")
+                    break
+
+                except Exception as exc:
+                    errors.append(f"{model}: {exc}")
+
+            if css_part is None:
+                raise RuntimeError(
+                    f"CSS section '{section_name}' failed on all models: "
+                    + " | ".join(errors)
+                )
+
+            generated.append(
+                f"\\n/* {section_name} */\\n{css_part}"
+            )
+
+        css = "\\n".join(generated)
+        validate_css(css)
+        return css
+
+    def build_page(self, design_summary, chunks):
+        if not isinstance(chunks, list) or not 1 <= len(chunks) <= 12:
+            raise ValueError("The Project Manager must provide between 1 and 12 section chunks.")
+
+        css = self._generate_css(design_summary)
+        fragments = []
+        section_titles = []
+        rolling_context = []
+
+        from .html_assembler import validate_fragment
+
+        # Allam first because it successfully generated the CSS.
+        models = [
+            MODELS["fast_worker"],
+            MODELS["dev_fallback"],
+            MODELS["dev_agent"],
+        ]
+
+        for index, chunk in enumerate(chunks, 1):
+            if not isinstance(chunk, dict):
+                raise ValueError(f"Build chunk {index} is not an object.")
+
+            title = str(chunk.get("chunk_title", f"Section {index}"))[:160]
+            instructions = str(chunk.get("instructions", ""))[:4500]
+
+            if not instructions.strip():
+                raise ValueError(f"Build chunk '{title}' has no instructions.")
+
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a senior frontend developer. Return ONLY one "
+                        "complete HTML section fragment. No Markdown, explanation, "
+                        "doctype, html, head, body, style, script, title, meta, "
+                        "or link tags. Use semantic accessible HTML, concise "
+                        "meaningful content, and properly nested tags. Do not "
+                        "invent testimonials, certifications, statistics, or facts. "
+                        "Use relative paths for local assets. Do not repeat sections."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Project: {self.project['name']}\\n"
+                        f"Design: {design_summary[:1800]}\\n"
+                        f"Assets: {str(self.asset_report)[:1000]}\\n"
+                        f"Previously generated: "
+                        f"{', '.join(rolling_context) or 'None'}\\n"
+                        f"Section {index} of {len(chunks)}: {title}\\n"
+                        f"Requirements: {instructions}\\n"
+                        "Return concise, complete HTML. Close every opened tag. "
+                        "Do not create the document wrapper."
+                    ),
+                },
+            ]
+
+            fragment = None
+            errors = []
+
+            for model in models:
+                try:
+                    response = self.router.chat(
+                        model,
+                        messages,
+                        estimated_out_tokens=650,
+                        fallback_models=[],
+                    )
+
+                    if _finish_reason(response) == "length":
+                        errors.append(f"{model}: response truncated")
+                        continue
+
+                    candidate = _clean_output(
+                        _message(response).content or ""
+                    ).strip()
+
+                    if not candidate:
+                        errors.append(f"{model}: empty response")
+                        continue
+
+                    try:
+                        validate_fragment(candidate, title)
+                    except Exception as exc:
+                        errors.append(f"{model}: invalid fragment: {exc}")
+                        continue
+
+                    fragment = candidate
+                    print(f"HTML section completed: {title} ({model})")
+                    break
+
+                except Exception as exc:
+                    errors.append(f"{model}: {exc}")
+
+            if fragment is None:
+                raise RuntimeError(
+                    f"Could not generate HTML section '{title}': "
+                    + " | ".join(errors)
+                )
+
+            fragments.append(fragment)
+            section_titles.append(title)
+            rolling_context.append(title)
+
+        output = assemble_page(
+            project_name=self.project["name"],
+            css=css,
+            fragments=fragments,
+            output_dir=self.root,
+            description=str(self.project.get("brief") or design_summary)[:300],
+        )
+        return (
+            f"Built and validated {len(fragments)} HTML sections into {output}; "
+            f"stylesheet: {self.root / 'styles.css'}; "
+            f"sections: {', '.join(section_titles)}"
+        )
+
+    def run(self, brief):
+        """Plan, source optional images, generate sections, assemble, and validate."""
+        task_id = self.store.add_task(
+            self.project["id"], "Plan and build website", brief, "project_manager"
+        )
+        self.store.update_task(task_id, "running")
+        pm_tools = [{
+            "type": "function",
+            "function": {
+                "name": "delegate_website_build",
+                "description": (
+                    "Return one compact homepage plan. Keep all descriptions brief; "
+                    "the frontend agent writes the actual HTML."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "image_brief": {
+                            "type": "string",
+                            "maxLength": 300,
+                            "description": "One short image-search description, at most 300 characters.",
+                        },
+                        "site_design_summary": {
+                            "type": "string",
+                            "maxLength": 900,
+                            "description": "Compact visual direction and palette, at most 900 characters.",
+                        },
+                        "build_chunks": {
+                            "type": "array",
+                            "minItems": 5,
+                            "maxItems": 5,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "chunk_title": {"type": "string", "maxLength": 80},
+                                    "instructions": {
+                                        "type": "string",
+                                        "maxLength": 500,
+                                        "description": "One or two concise sentences; no HTML code or CSS.",
+                                    },
+                                    "estimated_tokens": {
+                                        "type": "integer",
+                                        "minimum": 500,
+                                        "maximum": 1100,
+                                    },
+                                },
+                                "required": ["chunk_title", "instructions", "estimated_tokens"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    "required": ["image_brief", "site_design_summary", "build_chunks"],
+                    "additionalProperties": False,
+                },
+            },
+        }]
+        system_prompt = (
+            "You are the project manager for a professional website studio. "
+            "Call delegate_website_build exactly once. Return a compact plan for ONE "
+            "complete homepage. The plan MUST contain exactly five ordered sections: "
+            "1 Header/navigation; 2 Hero; 3 Services and benefits; "
+            "4 Educational/how-it-works content; 5 CTA and footer. "
+            "Keep image_brief under 300 characters and site_design_summary under 900. "
+            "Each section instruction must be one or two short sentences, under 500 "
+            "characters. Describe content and layout only: do not write HTML, CSS, "
+            "long lists, or implementation details. The assembler creates the document "
+            "wrapper and the frontend agent writes each section. Do not invent prices, "
+            "testimonials, awards, addresses, certifications, or business facts; use "
+            "clearly marked placeholders when information is missing."
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": str(brief)[:6000]},
+        ]
+
+        try:
+            self.store.set_project_status(self.project["id"], "building")
+            try:
+                response = self.router.chat(
+                    MODELS["pm"], messages, tools=pm_tools, estimated_out_tokens=1800,
+                    fallback_models=[MODELS["dev_agent"], MODELS["image_agent"]],
+                )
+            except Exception as first_exc:
+                if not _is_malformed_tool_call_error(first_exc):
+                    raise
+                # Retry once with a shorter brief and an explicit compact-output contract.
+                retry_messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Call delegate_website_build exactly once. Output only a compact "
+                            "five-section homepage plan. Use very short phrases, not paragraphs. "
+                            "Exactly five sections: header, hero, services/benefits, education, "
+                            "CTA/footer. Keep image_brief <=300 chars, design summary <=900 chars, "
+                            "and each section instruction <=500 chars. No HTML or CSS."
+                        ),
+                    },
+                    {"role": "user", "content": str(brief)[:2500]},
+                ]
+                try:
+                    response = self.router.chat(
+                        MODELS["pm"], retry_messages, tools=pm_tools, estimated_out_tokens=1800,
+                        fallback_models=[MODELS["dev_agent"], MODELS["image_agent"]],
+                    )
+                except Exception as retry_exc:
+                    if _is_malformed_tool_call_error(retry_exc):
+                        raise RuntimeError(
+                            "Groq twice returned an incomplete Project Manager tool call. "
+                            "The plan was not accepted and no page was published. "
+                            "The prompt/schema is now compact; check the selected model's "
+                            "output-token quota before retrying."
+                        ) from retry_exc
+                    raise
+
+            if _finish_reason(response) == "length":
+                raise RuntimeError(
+                    "Project Manager plan was truncated by Groq's output-token limit. "
+                    "No page was published."
+                )
+            msg = _message(response)
+            calls = getattr(msg, "tool_calls", None) or []
+            if len(calls) != 1 or calls[0].function.name != "delegate_website_build":
+                raise RuntimeError(
+                    "Project Manager must dispatch delegate_website_build exactly once. "
+                    "No page was published."
+                )
+            try:
+                args = json.loads(calls[0].function.arguments)
+            except (TypeError, json.JSONDecodeError) as parse_exc:
+                raise RuntimeError(
+                    "Project Manager returned invalid JSON arguments. No page was published."
+                ) from parse_exc
+            args = _validate_build_plan(args)
+
+            image_task = self.store.add_task(
+                self.project["id"], "Source website images", args["image_brief"], "image_sourcer"
+            )
+            self.store.update_task(image_task, "running")
+            try:
+                image_result = self.source_images(args["image_brief"])
+                self.store.update_task(image_task, "completed", image_result)
+            except Exception as image_exc:
+                self.asset_report = (
+                    "Image sourcing was unavailable; use CSS gradients or inline SVG. "
+                    f"Details: {image_exc}"
+                )
+                self.store.update_task(image_task, "failed", str(image_exc))
+
+            frontend_task = self.store.add_task(
+                self.project["id"], "Generate and assemble homepage",
+                args["site_design_summary"], "frontend_developer",
+            )
+            self.store.update_task(frontend_task, "running")
+            try:
+                result = self.build_page(args["site_design_summary"], args["build_chunks"])
+                self.store.update_task(frontend_task, "completed", result)
+            except Exception as frontend_exc:
+                self.store.update_task(frontend_task, "failed", str(frontend_exc))
+                raise
+
+            report = (
+                f"Project: {self.project['name']}\n"
+                f"{result}\n\nImage report:\n{self.asset_report}\n"
+            )
+            self._write("BUILD_REPORT.txt", report)
+            self.store.update_task(task_id, "completed", result)
+            self.store.set_project_status(self.project["id"], "built")
+            return result
+        except Exception as exc:
+            self.store.update_task(task_id, "failed", str(exc))
+            self.store.set_project_status(self.project["id"], "build_failed")
+            raise

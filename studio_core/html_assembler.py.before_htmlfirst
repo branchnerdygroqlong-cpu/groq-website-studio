@@ -1,0 +1,186 @@
+"""Deterministic HTML5 document assembler and lightweight structural validation."""
+from __future__ import annotations
+
+from html import escape
+from html.parser import HTMLParser
+from pathlib import Path
+import os
+import re
+import tempfile
+
+_VOID_TAGS = {
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+    "meta", "param", "source", "track", "wbr",
+}
+_OPTIONAL_END_TAGS = {"li", "dt", "dd", "p", "rt", "rp", "optgroup", "option",
+                      "colgroup", "thead", "tbody", "tfoot", "tr", "td", "th"}
+_BLOCK_STARTS = {
+    "address", "article", "aside", "blockquote", "div", "dl", "fieldset",
+    "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header",
+    "hr", "main", "nav", "ol", "p", "pre", "section", "table", "ul",
+}
+
+class _FragmentValidator(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack = []
+        self.errors = []
+
+    def _implicit_close(self, tag):
+        if tag == "li" and self.stack and self.stack[-1] == "li":
+            self.stack.pop()
+        elif tag in {"dt", "dd"} and self.stack and self.stack[-1] in {"dt", "dd"}:
+            self.stack.pop()
+        elif tag == "option" and self.stack and self.stack[-1] == "option":
+            self.stack.pop()
+        elif tag in _BLOCK_STARTS and self.stack and self.stack[-1] == "p":
+            self.stack.pop()
+
+    def handle_starttag(self, tag, attrs):
+        self._implicit_close(tag)
+        if tag in {"html", "head", "body", "style", "script", "title", "meta", "link"}:
+            self.errors.append(f"document-level or disallowed tag <{tag}> in section fragment")
+        if tag not in _VOID_TAGS:
+            self.stack.append(tag)
+
+    def handle_startendtag(self, tag, attrs):
+        if tag in {"html", "head", "body", "style", "script", "title", "meta", "link"}:
+            self.errors.append(f"document-level or disallowed tag <{tag}/> in section fragment")
+
+    def handle_endtag(self, tag):
+        if tag in _VOID_TAGS:
+            self.errors.append(f"void tag </{tag}> must not have a closing tag")
+            return
+        if tag not in self.stack:
+            self.errors.append(f"unexpected closing tag </{tag}>")
+            return
+        if self.stack[-1] != tag:
+            self.errors.append(
+                f"misnested closing tag </{tag}>; expected </{self.stack[-1]}>"
+            )
+            return
+        self.stack.pop()
+
+    def close(self):
+        super().close()
+        # HTML permits omission of these end tags in common contexts.
+        while self.stack and self.stack[-1] in _OPTIONAL_END_TAGS:
+            self.stack.pop()
+        if self.stack:
+            self.errors.append("unclosed tags: " + ", ".join(f"<{t}>" for t in self.stack))
+
+
+def validate_fragment(fragment: str, label: str = "section") -> None:
+    if not isinstance(fragment, str) or not fragment.strip():
+        raise ValueError(f"{label}: empty HTML fragment")
+    if re.search(r"<!doctype|<\s*/?\s*(html|head|body)\b", fragment, re.I):
+        raise ValueError(f"{label}: return section markup only, not an HTML document wrapper")
+    parser = _FragmentValidator()
+    try:
+        parser.feed(fragment)
+        parser.close()
+    except Exception as exc:
+        raise ValueError(f"{label}: HTML parsing failed: {exc}") from exc
+    if parser.errors:
+        raise ValueError(f"{label}: " + "; ".join(parser.errors))
+
+
+def validate_css(css: str) -> None:
+    if not isinstance(css, str) or len(css.strip()) < 80:
+        raise ValueError("Generated CSS is empty or implausibly short.")
+    if len(css) > 40000:
+        raise ValueError("Generated CSS is unexpectedly large.")
+    if re.search(r"</\s*style", css, re.I):
+        raise ValueError("CSS contains a closing style tag; provide CSS only.")
+    depth = 0
+    quote = None
+    escaped = False
+    comment = False
+    i = 0
+    while i < len(css):
+        ch = css[i]
+        nxt = css[i + 1] if i + 1 < len(css) else ""
+        if comment:
+            if ch == "*" and nxt == "/":
+                comment = False
+                i += 2
+                continue
+        elif quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+        elif ch == "/" and nxt == "*":
+            comment = True
+            i += 2
+            continue
+        elif ch in {"'", '"'}:
+            quote = ch
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth < 0:
+                raise ValueError("Generated CSS has an unexpected closing brace.")
+        i += 1
+    if quote or comment or depth != 0:
+        raise ValueError("Generated CSS appears truncated (unclosed quote, comment, or brace).")
+    if depth == 0 and "{" not in css:
+        raise ValueError("Generated CSS contains no rules.")
+
+
+def assemble_page(project_name: str, css: str, fragments: list[str],
+                  output_dir: str | Path, description: str = "") -> Path:
+    """Validate all parts, then atomically write styles.css and index.html."""
+    if not fragments:
+        raise ValueError("Cannot assemble a page without HTML section fragments.")
+    validate_css(css)
+    for index, fragment in enumerate(fragments, 1):
+        validate_fragment(fragment, f"section {index}")
+
+    title = escape((project_name or "Website").strip())
+    desc = escape((description or f"{project_name} website").strip(), quote=True)
+    body = "\n\n".join(fragment.strip() for fragment in fragments)
+    document = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="{desc}">
+  <meta name="theme-color" content="#ffffff">
+  <title>{title}</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+{body}
+</body>
+</html>
+"""
+    # Verify the wrapper itself is structurally complete before touching output files.
+    required = ["<!doctype html>", "<html", "<head>", "</head>", "<body>", "</body>", "</html>"]
+    lowered = document.lower()
+    if not all(token in lowered for token in required):
+        raise ValueError("Assembler generated an incomplete HTML document.")
+
+    root = Path(output_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    targets = {"styles.css": css.strip() + "\n", "index.html": document}
+    temp_paths = {}
+    try:
+        for filename, content in targets.items():
+            fd, temp_name = tempfile.mkstemp(prefix=f".{filename}.", suffix=".tmp", dir=root)
+            temp_paths[filename] = Path(temp_name)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+                stream.write(content)
+        # Both files are fully written before either published path is replaced.
+        for filename in ("styles.css", "index.html"):
+            os.replace(temp_paths[filename], root / filename)
+    finally:
+        for temp in temp_paths.values():
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return root / "index.html"

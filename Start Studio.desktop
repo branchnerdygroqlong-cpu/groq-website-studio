@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Groq Website Studio
+Comment=Start the website builder
+Exec=env STUDIO_PAUSE=1 /home/jay/groq-website-studio/start_studio.sh
+Path=/home/jay/groq-website-studio
+Terminal=true
+Icon=applications-internet
